@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+
+# PART 2: DE NOVO ASSEMBLY, SHIVER AND COVERAGE CALCULATION
+# de_novo_with_shiver.bsh will interate over all subdirectiories and process
+# all paired, compressed fastq files (*fast.gz) to:
+## QC filter reads
+## generate consenus using shiver
+## map reads to generated consensus using bwa-mem
+## produce coverage data
+# You can run this script with default parameters (using provided FMDV reference database, 
+# adapters and primers fasta files in the same directory as the script) or specify your own parameters.
+
+
+# Determine the current path
+C_PATH="$(pwd)"
+
+# Determine where this script lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# default values if arguments are missing
+FASTA_DATA_BASE="${SCRIPT_DIR}/../data/FMDV_selected_sequences.fasta"
+MY_ADAPTERS="${SCRIPT_DIR}/../data/MyAdapter.fasta"
+MY_PRIMERS="${SCRIPT_DIR}/../data/MyPrimers.fasta"
+# Path to the FastQ_Screen genome data directory
+FQS_DATA="${SCRIPT_DIR}/../data/"
+FQS_TEMPLATE="${SCRIPT_DIR}/fastq_screen.conf.template"
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fasta)
+            FASTA_DATA_BASE="$2"
+            shift 2
+            ;;
+        --adapters)
+            MY_ADAPTERS="$2"
+            shift 2
+            ;;
+        --primers)
+            MY_PRIMERS="$2"
+            shift 2
+            ;;
+        --fqs_genomes)
+            FQS_DATA="$2"
+            shift 2
+            ;;
+        --fqs_template)
+            FQS_TEMPLATE="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--fasta FILE] [--adapters FILE] [--primers FILE] [--fqs_genomes DIR] [--fqs_template FILE]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+echo "FASTA: $FASTA_DATA_BASE"
+echo "Adapters: $MY_ADAPTERS"
+echo "Primers: $MY_PRIMERS"
+echo "FQS Data: $FQS_DATA"
+echo "FQS Template: $FQS_TEMPLATE"
+
+
+
+# initiate shiver: 
+
+echo "Initialise shiver"
+
+# initiate shiver for this project directory:
+shiver_init.sh ${C_PATH}/MyInitDir ${SCRIPT_DIR}/config_bwa_default.sh ${FASTA_DATA_BASE} ${MY_ADAPTERS} ${MY_PRIMERS}
+
+
+
+# declare array:
+
+declare -a array=($(ls --ignore='*.*' --ignore='MyInitDir'))
+for i in "${array[@]}"
+do
+#echo "$i"
+cd ${C_PATH}/$i
+
+
+# QUALITY FILTERING:
+
+echo "Running QC"
+
+# check quality of data using FastQC:
+fastqc *_R1*.fastq.gz *_R2*.fastq.gz
+
+# de-duplicate the reads after the trimming step, since the ends appear error-prone, they might differ even in duplicates.
+
+# trim ends with Prinseq++
+prinseq++ -fastq *_R1*.fastq.gz -trim_left 20 -trim_right 5 -out_format 0 -out_name trimmed_reads_R1
+prinseq++ -fastq *_R2*.fastq.gz -trim_left 20 -trim_right 5 -out_format 0 -out_name trimmed_reads_R2
+
+# quality filter with Sickle
+# sickle seems to be the only program which uses a sliding window and tehrefore trims parts of a read with poor quality rather than removing the whole read:
+sickle se -f trimmed_reads_R1_good_out.fastq -t sanger -o trimmed_reads_sk_R1.fastq -q 30 -l 70 -n -x
+sickle se -f trimmed_reads_R2_good_out.fastq -t sanger -o trimmed_reads_sk_R2.fastq -q 30 -l 70 -n -x
+
+# remove duplicates with SeqKit:
+cat trimmed_reads_sk_R1.fastq | seqkit rmdup -s -o trimmed_reads_sk_R1_rmdup.fastq -d trimmed_reads_sk_R1_duplicated.fastq -D trimmed_reads_sk_R1_duplicated_stat.txt
+cat trimmed_reads_sk_R2.fastq | seqkit rmdup -s -o trimmed_reads_sk_R2_rmdup.fastq -d trimmed_reads_sk_R2_duplicated.fastq -D trimmed_reads_sk_R2_duplicated_stat.txt
+## -s # by sequence
+## -o # output
+## -d # save duplicated sequences in this output (maybe do not use it as you will end up with large duplication of data)
+## -D # print list of duplicated sequences
+
+# Rewrite config file from template
+sed "s|__DATA_DIR__|$FQS_DATA|g" \
+    "$FQS_TEMPLATE" \
+    > "$SCRIPT_DIR/fastq_screen.conf"
+
+# Run fastq_screen with the rewritten config to remove contamination
+fastq_screen \
+    --aligner bowtie2 \
+    --conf "$SCRIPT_DIR/fastq_screen.conf" \
+    --nohits \
+    --subset 0 \
+    trimmed_reads_sk_R1_rmdup.fastq \
+    trimmed_reads_sk_R2_rmdup.fastq
+
+
+# Check quality of QC filtered reads:
+fastqc trimmed_reads_sk_R1_rmdup.fastq trimmed_reads_sk_R2_rmdup.fastq
+
+# Using FastQC test if any potential contamination was removed after fastq_screen:
+fastqc trimmed_reads_sk_R1_rmdup.tagged_filter.fastq trimmed_reads_sk_R2_rmdup.tagged_filter.fastq
+
+
+#Seperating reads into paired and unpaired reads using seqkit pair:
+
+# for QC-only filtered reads:
+seqkit pair -1 trimmed_reads_sk_R1_rmdup.fastq -2 trimmed_reads_sk_R2_rmdup.fastq -O paired_reads_QC_only -u
+# -u # save unpaired reads into a file (do not specify file name as you will get an error)
+# -O # output directory
+# -1 and -2 # R1 and R2 fastq file
+
+# merging unpaired reads into a single file:
+cat paired_reads_QC_only/trimmed_reads_sk_R1_rmdup.unpaired.fastq >> paired_reads_QC_only/trimmed_reads_sk_rmdup_unpaired.fastq
+cat paired_reads_QC_only/trimmed_reads_sk_R2_rmdup.unpaired.fastq >> paired_reads_QC_only/trimmed_reads_sk_rmdup_unpaired.fastq
+
+
+
+# SPAdes de novo assembly:
+
+echo "Running SPAdes"
+
+# Running SPAdes on contamination-unfiltered reads (as recommended Shiver's manual):  
+
+# run SPAdes careful mode:
+# SPAdes v3.13.1 is installed system-wide, therefore specify PATH to SPAdes 3.15.5:
+# SPAdes v3.13.1 does not seem to have a --metaviral mode, if using SPAdes v3.13.1, deactivate metaviral mode:
+spades -k 21,33,55,77 --careful -1 paired_reads_QC_only/trimmed_reads_sk_R1_rmdup.fastq -2 paired_reads_QC_only/trimmed_reads_sk_R2_rmdup.fastq -s paired_reads_QC_only/trimmed_reads_sk_rmdup_unpaired.fastq -o spades_careful
+
+
+
+# RUN SHIVER: 
+
+echo "Running shiver: part 1"
+
+# convert reads IDs to fit shiver requirements:
+	# there is no other gz files than origimal so this will work. 
+  # NEXT TIME USE TRIMMED READS!!!!
+cat *_R1*.fastq.gz | seqkit replace -p "\s.+" | seqkit replace -p $ -r '/1' > ${i}_R1_mod.fastq
+cat *_R2*.fastq.gz | seqkit replace -p "\s.+" | seqkit replace -p $ -r '/2' > ${i}_R2_mod.fastq
+
+
+
+
+# align contigs to the reference:
+shiver_align_contigs.sh ${C_PATH}/MyInitDir ${SCRIPT_DIR}/config_bwa_default.sh ${C_PATH}/$i/spades_careful/contigs.fasta ${i}
+
+# align reads to the reference:
+shiver_map_reads.sh ${C_PATH}/MyInitDir ${SCRIPT_DIR}/config_bwa_default.sh ${C_PATH}/$i/spades_careful/contigs.fasta ${i} ${i}.blast ${i}_cut_wRefs.fasta ${i}_R1_mod.fastq ${i}_R2_mod.fastq
+
+
+
+# CREATE COVERAGE DATA BASED ON SHIVER_GENERATED BAM FILE:
+
+echo "Generating shiver coverage file"
+
+# sort BAM file: 
+samtools sort ${i}_remap.bam -o ${i}_remap_sorted.bam
+
+# calculate coverage:
+samtools depth ${i}_remap_sorted.bam > ${i}_shiver_coverage.txt
+awk '{print $2, $3}' ${i}_shiver_coverage.txt > ${i}_shiver_coverage_data_only.txt
+
+
+
+# generate the shiver reference fasta file for bwa-mem re-mapping:
+
+echo "Creating Shiver Ref file"
+
+
+# use seqkit to obtain consensus sequence generated by shiver for bwa-mem mapping
+
+seqkit grep -r -p "ConsensusRound1_GapsFilled" ${i}_remap_consensus_MinCov_15_30.fasta > ${i}_shiver_final_ref.fasta
+
+
+
+# Calculate coverage based on BWA mapping of contamination-free reads:
+
+echo "Calculating BWA-MEM based coverage"
+
+# map reads to the reference using BWA:
+
+
+# Seperating reads into paired and unpaired reads using seqkit pair:
+
+# for QC-only filtered reads:
+seqkit pair -1 trimmed_reads_sk_R1_rmdup.tagged_filter.fastq -2 trimmed_reads_sk_R2_rmdup.tagged_filter.fastq -O paired_contamination_filtered -u
+# -u # save unpaired reads into a file (do not specify file name as you will get an error)
+# -O # output directory
+# -1 and -2 # R1 and R2 fastq file
+
+# merging unpaired reads into a single file:
+cat paired_contamination_filtered/trimmed_reads_sk_R1_rmdup.tagged_filter.unpaired.fastq >> paired_reads_QC_only/trimmed_reads_sk_rmdup_tagged_filter_unpaired.fastq
+cat paired_contamination_filtered/trimmed_reads_sk_R2_rmdup.tagged_filter.unpaired.fastq >> paired_reads_QC_only/trimmed_reads_sk_rmdup_tagged_filter_unpaired.fastq
+
+
+#index reference file:
+
+bwa index ${i}_shiver_final_ref.fasta
+
+## mapp paired reads:
+bwa mem -t 16 ${i}_shiver_final_ref.fasta paired_contamination_filtered/trimmed_reads_sk_R1_rmdup.tagged_filter.fastq paired_contamination_filtered/trimmed_reads_sk_R2_rmdup.tagged_filter.fastq > ${i}_bwa_mapped_pe.sam
+
+## map unpaired reads:
+bwa mem -t 16 ${i}_shiver_final_ref.fasta paired_reads_QC_only/trimmed_reads_sk_rmdup_tagged_filter_unpaired.fastq > ${i}_bwa_mapped_se.sam
+
+
+#convert SAM file to BAM file:
+
+samtools view -bS ${i}_bwa_mapped_pe.sam > ${i}_bwa_mapped_pe.bam
+samtools view -bS ${i}_bwa_mapped_se.sam > ${i}_bwa_mapped_se.bam
+
+
+# sort BAM file:
+
+samtools sort ${i}_bwa_mapped_pe.bam -o ${i}_bwa_mapped_pe.sorted.bam
+samtools sort ${i}_bwa_mapped_se.bam -o ${i}_bwa_mapped_se.sorted.bam
+
+# index BAM file:
+samtools index ${i}_bwa_mapped_pe.sorted.bam
+samtools index ${i}_bwa_mapped_se.sorted.bam
+
+# create coverage plot:
+
+samtools depth ${i}_bwa_mapped_pe.sorted.bam ${i}_bwa_mapped_se.sorted.bam > ${i}_bwa_mapped_coverage.txt
+awk '{print $2, $3}' ${i}_bwa_mapped_coverage.txt > ${i}_bwa_mapped_coverage_data_only.txt
+
+done

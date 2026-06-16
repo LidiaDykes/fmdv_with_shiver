@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# PART 1: ORGANISE FASTQ FILES INTO DIRECTORIES
+# This is the first script which will create subdirectories and move data into these subdirectories
+# 
+
+# $1 state the absolute path to your data
+# $2 name the symlink 
+
+# check that the user has provided the correct number of arguments:
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <absolute_path_to_data> <name_of_symlink>"
+    exit 1
+fi
+
+# create analysis directory:
+mkdir "analysis_"`date +"%Y-%m-%d"`
+
+# create symlink to the data:
+ln -s $1 $(pwd)/$2
+path=$(pwd)
+
+cd "${path}"/"$2"
+# list all the samples:
+declare -a array=($(ls *R1_001.fastq* | sed 's/_R1_001.fastq.gz//'))
+for i in "${array[@]}"
+do
+#echo "$i"
+sample="$i"
+echo "${sample}"
+
+# create sample sub-directories:
+mkdir "${path}"/"analysis_"`date +"%Y-%m-%d"`/"${sample}"
+
+# copy fastq files into subdirectories: 
+cp "${sample}"_R1_001.fastq.gz "${path}"/"analysis_"`date +"%Y-%m-%d"`/"${sample}"
+cp "${sample}"_R2_001.fastq.gz "${path}"/"analysis_"`date +"%Y-%m-%d"`/"${sample}"
+
+done
