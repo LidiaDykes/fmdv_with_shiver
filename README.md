@@ -99,11 +99,11 @@ If you would like to store genomic sequences of common contaminants elsewhere (e
 # enter the fmdv_with_shiver/data
 cd ../data
 
-# OPTIONAL: move the compressed file to a new location
-mv FastQ_Screen_Genomes.tar.gz /path/to/the/new/location
-
 # uncompress data directory
 tar -xzvf FastQ_Screen_Genomes.tar.gz
+
+# OPTIONAL: if you wish to move the compressed file to a new location
+mv FastQ_Screen_Genomes.tar.gz /path/to/the/new/directory
 ```
 
 ### 1.h. Download host genomes
